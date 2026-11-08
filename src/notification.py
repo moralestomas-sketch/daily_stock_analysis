@@ -1413,6 +1413,13 @@ class NotificationService(
                     if news_disclosure:
                         report_lines.append(news_disclosure)
                     self._append_data_sources_line(report_lines, r, labels)
+            if not self._report_summary_only:
+                self._append_comparison_table(
+                    report_lines,
+                    sorted_results,
+                    labels,
+                    report_language,
+                )
             report_lines.extend([
                 "",
                 "---",
@@ -2214,6 +2221,111 @@ class NotificationService(
         if not mapping:
             return raw_source
         return mapping[normalize_report_language(language)]
+
+    _COMPARISON_LABELS = {
+        "zh": {
+            "heading": "横向对比（估值与业绩）",
+            "name": "股票",
+            "score": "评分",
+            "advice": "建议",
+            "pe": "PE(动态)",
+            "rev_yoy": "营收同比",
+            "np_yoy": "净利同比",
+            "roe": "ROE",
+        },
+        "en": {
+            "heading": "Cross-Stock Comparison (Valuation & Growth)",
+            "name": "Stock",
+            "score": "Score",
+            "advice": "Advice",
+            "pe": "PE (TTM)",
+            "rev_yoy": "Revenue YoY",
+            "np_yoy": "Net Profit YoY",
+            "roe": "ROE",
+        },
+        "ko": {
+            "heading": "종목 비교 (밸류에이션과 실적)",
+            "name": "종목",
+            "score": "점수",
+            "advice": "의견",
+            "pe": "PER(동적)",
+            "rev_yoy": "매출 전년比",
+            "np_yoy": "순이익 전년比",
+            "roe": "ROE",
+        },
+    }
+
+    def _comparison_metrics(self, result: AnalysisResult) -> Dict[str, Any]:
+        """Collect PE / revenue growth / profit growth / ROE for one result."""
+        blocks = self._get_fundamental_blocks(result)
+        report = blocks.get("financial_report") or {}
+        growth = blocks.get("growth") or {}
+        snapshot = getattr(result, "market_snapshot", None) or {}
+
+        def number(value: Any) -> Optional[float]:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        roe = number(report.get("roe"))
+        if roe is None:
+            roe = number(growth.get("roe"))
+        return {
+            "pe": number(snapshot.get("pe_ratio")),
+            "rev_yoy": number(growth.get("revenue_yoy")),
+            "np_yoy": number(growth.get("net_profit_yoy")),
+            "roe": roe,
+        }
+
+    @staticmethod
+    def _format_metric(value: Optional[float], digits: int = 1, percent: bool = False) -> str:
+        if value is None or value != value:  # NaN
+            return "N/A"
+        text = ("%." + str(digits) + "f") % value
+        return text + "%" if percent else text
+
+    def _append_comparison_table(
+        self,
+        lines: List[str],
+        results: List[AnalysisResult],
+        labels: Dict[str, str],
+        report_language: Optional[str] = None,
+    ) -> None:
+        """Append a cross-stock table so PE and growth can be scanned in one place."""
+        language = normalize_report_language(report_language)
+        text_labels = self._COMPARISON_LABELS.get(language) or self._COMPARISON_LABELS["zh"]
+        rows = [(result, self._comparison_metrics(result)) for result in results]
+        if not any(any(value is not None for value in metrics.values()) for _, metrics in rows):
+            return
+
+        lines.extend([
+            f"### 📊 {text_labels['heading']}",
+            "",
+            (
+                f"| {text_labels['name']} | {text_labels['score']} | {text_labels['advice']} | "
+                f"{text_labels['pe']} | {text_labels['rev_yoy']} | {text_labels['np_yoy']} | "
+                f"{text_labels['roe']} |"
+            ),
+            "|:------|-----:|:----:|-----:|-----:|-----:|-----:|",
+        ])
+        for result, metrics in rows:
+            signal_text, signal_emoji, _ = self._get_signal_level(result)
+            display_name = self._get_display_name(result, report_language)
+            lines.append(
+                "| %s(%s) | %s | %s %s | %s | %s | %s | %s |" % (
+                    display_name,
+                    result.code,
+                    result.sentiment_score,
+                    signal_emoji,
+                    signal_text,
+                    self._format_metric(metrics["pe"]),
+                    self._format_metric(metrics["rev_yoy"], percent=True),
+                    self._format_metric(metrics["np_yoy"], percent=True),
+                    self._format_metric(metrics["roe"], percent=True),
+                )
+            )
+        lines.append("")
 
     def _append_market_snapshot(self, lines: List[str], result: AnalysisResult) -> None:
         snapshot = getattr(result, 'market_snapshot', None)

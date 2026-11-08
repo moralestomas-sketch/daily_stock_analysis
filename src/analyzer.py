@@ -5147,6 +5147,17 @@ Output the complete Decision Dashboard in JSON format."""
         except (TypeError, ValueError):
             return 'N/A'
 
+    @staticmethod
+    def _snapshot_number(value: Any) -> Any:
+        """Return a 2-decimal number for snapshot metrics, 'N/A' when unusable."""
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return "N/A"
+        if number != number or number in (float('inf'), float('-inf')):
+            return "N/A"
+        return round(number, 2)
+
     def _build_market_snapshot(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """构建当日行情快照（展示用）"""
         today = context.get('today', {}) or {}
@@ -5191,6 +5202,8 @@ Output the complete Decision Dashboard in JSON format."""
                 "volume_ratio": realtime.get('volume_ratio', 'N/A'),
                 "turnover_rate": self._format_percent(realtime.get('turnover_rate')),
                 "source": getattr(realtime.get('source'), 'value', realtime.get('source', 'N/A')),
+                "pe_ratio": self._snapshot_number(realtime.get('pe_ratio')),
+                "pb_ratio": self._snapshot_number(realtime.get('pb_ratio')),
             })
 
         return snapshot
