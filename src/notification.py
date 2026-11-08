@@ -59,7 +59,9 @@ from src.schemas.decision_action import (
     display_action_fields_for_result,
     display_decision_type_for_result,
     display_operation_advice_for_result,
+    localize_action_label,
 )
+from src.schemas.decision_scale import action_for_score
 from bot.models import BotMessage
 from src.utils.sanitize import sanitize_diagnostic_text
 from src.formatters import strip_hidden_markdown_metadata
@@ -936,17 +938,15 @@ class NotificationService(
             reverse=True
         )
 
-        buy_count, sell_count, hold_count = self._count_display_decisions(results, report_language)
         avg_score = sum(r.sentiment_score for r in results) / len(results) if results else 0
+        decision_rows = self._display_decision_table_rows(results, labels, report_language)
 
         report_lines.extend([
             f"## 📊 {labels['summary_heading']}",
             "",
             "| 指标 | 数值 |",
             "|------|------|",
-            f"| 🟢 {labels['buy_label']} | **{buy_count}** {labels['stock_unit_compact']} |",
-            f"| 🟡 {labels['watch_label']} | **{hold_count}** {labels['stock_unit_compact']} |",
-            f"| 🔴 {labels['sell_label']} | **{sell_count}** {labels['stock_unit_compact']} |",
+            *decision_rows,
             f"| 📈 {labels['avg_score_label']} | **{avg_score:.1f}** |",
             "",
             "---",
@@ -1224,31 +1224,107 @@ class NotificationService(
         hold_count = len(buckets) - buy_count - sell_count
         return buy_count, sell_count, hold_count
 
+    _DECISION_BADGE_EMOJI = {
+        "buy": "🟢",
+        "add": "🟢",
+        "hold": "🟡",
+        "watch": "⚪",
+        "reduce": "🟠",
+        "sell": "🔴",
+        "avoid": "🔴",
+        "alert": "⚠️",
+    }
+    _DECISION_BADGE_ORDER = ("buy", "add", "hold", "watch", "reduce", "sell", "avoid", "alert")
+
+    def _aligned_display_action(
+        self,
+        result: AnalysisResult,
+        report_language: Optional[str] = None,
+    ) -> tuple:
+        """Return (action, label, emoji) with the badge aligned to the canonical score band."""
+        language = report_language or self._get_report_language(result)
+        try:
+            fields = display_action_fields_for_result(result, report_language=language)
+        except Exception:
+            fields = {"action": None, "action_label": None}
+        action = fields.get("action")
+        band_action = action_for_score(getattr(result, "sentiment_score", None))
+        if band_action and action in {"hold", "watch"} and band_action in {"buy", "reduce", "sell"}:
+            action = band_action
+        if not action:
+            return None, fields.get("action_label"), None
+        label = localize_action_label(action, language) or fields.get("action_label")
+        emoji = self._DECISION_BADGE_EMOJI.get(action)
+        return action, label, emoji
+
+    def _display_decision_breakdown(
+        self,
+        results: List[AnalysisResult],
+        report_language: Optional[str] = None,
+    ) -> List[tuple]:
+        """Group results by displayed action so the summary mirrors the stock rows."""
+        language = report_language or self._get_report_language(results)
+        buckets: Dict[str, Dict[str, Any]] = {}
+        for result in results:
+            action, label, emoji = self._aligned_display_action(result, language)
+            key = action or "watch"
+            bucket = buckets.setdefault(
+                key,
+                {"emoji": emoji or "⚪", "label": label or "", "count": 0},
+            )
+            bucket["count"] += 1
+        ordered: List[tuple] = []
+        for action in self._DECISION_BADGE_ORDER:
+            bucket = buckets.get(action)
+            if bucket and bucket["count"]:
+                ordered.append((bucket["emoji"], bucket["label"], bucket["count"]))
+        for action, bucket in buckets.items():
+            if action not in self._DECISION_BADGE_ORDER and bucket["count"]:
+                ordered.append((bucket["emoji"], bucket["label"], bucket["count"]))
+        return ordered
+
+    def _format_display_decision_summary(
+        self,
+        results: List[AnalysisResult],
+        report_language: Optional[str] = None,
+    ) -> str:
+        """Render '🟢买入:x 🟡持有:y ⚪观望:z 🟠减仓:u 🔴卖出:v' with per-bucket colors."""
+        parts = [
+            "%s%s:%d" % (emoji, label, count)
+            for emoji, label, count in self._display_decision_breakdown(results, report_language)
+            if label
+        ]
+        return " ".join(parts)
+
+    def _display_decision_table_rows(
+        self,
+        results: List[AnalysisResult],
+        labels: Dict[str, str],
+        report_language: Optional[str] = None,
+    ) -> List[str]:
+        """Render the metrics table rows for the displayed decision buckets."""
+        rows: List[str] = []
+        for emoji, label, count in self._display_decision_breakdown(results, report_language):
+            if label:
+                rows.append(
+                    "| %s %s | **%d** %s |" % (emoji, label, count, labels["stock_unit_compact"])
+                )
+        return rows
+
     def _get_signal_level(self, result: AnalysisResult) -> tuple:
-        """Get display text and signal metadata from the resolved action."""
+        """Get display text and signal metadata from the score-aligned action."""
         report_language = self._get_report_language(result)
-        display_fields = display_action_fields_for_result(
-            result,
-            report_language=report_language,
-        )
-        signal_advice = {
-            "buy": "buy",
-            "add": "buy",
-            "hold": "hold",
-            "reduce": "reduce",
-            "sell": "sell",
-            "watch": "watch",
-            "avoid": "hold",
-            "alert": "sell",
-        }.get(display_fields["action"])
-        _, emoji, signal_tag = get_signal_level(
-            signal_advice or self._get_display_operation_advice(result, report_language),
+        action, label, emoji = self._aligned_display_action(result, report_language)
+        if action and label and emoji:
+            return label, emoji, action
+        _, fallback_emoji, signal_tag = get_signal_level(
+            self._get_display_operation_advice(result, report_language),
             result.sentiment_score,
             report_language,
         )
         return (
             self._get_display_operation_advice(result, report_language),
-            emoji,
+            fallback_emoji,
             signal_tag,
         )
 
@@ -1307,13 +1383,13 @@ class NotificationService(
         # 按评分排序（高分在前）
         sorted_results = sorted(results, key=lambda x: x.sentiment_score, reverse=True)
 
-        buy_count, sell_count, hold_count = self._count_display_decisions(results, report_language)
+        decision_summary = self._format_display_decision_summary(results, report_language)
 
         report_lines = [
             f"# 🎯 {report_date} {labels['dashboard_title']}",
             "",
             f"> {labels['analyzed_prefix']} **{len(results)}** {labels['stock_unit']} | "
-            f"🟢{labels['buy_label']}:{buy_count} 🟡{labels['watch_label']}:{hold_count} 🔴{labels['sell_label']}:{sell_count}",
+            f"{decision_summary}",
         ]
         self._append_market_status_line(report_lines, results, report_language)
 
@@ -1653,13 +1729,13 @@ class NotificationService(
         # 按评分排序
         sorted_results = sorted(results, key=lambda x: x.sentiment_score, reverse=True)
 
-        buy_count, sell_count, hold_count = self._count_display_decisions(results, report_language)
+        decision_summary = self._format_display_decision_summary(results, report_language)
 
         lines = [
             f"## 🎯 {report_date} {labels['dashboard_title']}",
             "",
             f"> {len(results)} {labels['stock_unit']} | "
-            f"🟢{labels['buy_label']}:{buy_count} 🟡{labels['watch_label']}:{hold_count} 🔴{labels['sell_label']}:{sell_count}",
+            f"{decision_summary}",
         ]
         self._append_market_status_line(lines, results, report_language)
 
@@ -1833,14 +1909,14 @@ class NotificationService(
         # 按评分排序
         sorted_results = sorted(results, key=lambda x: x.sentiment_score, reverse=True)
 
-        buy_count, sell_count, hold_count = self._count_display_decisions(results, report_language)
+        decision_summary = self._format_display_decision_summary(results, report_language)
         avg_score = sum(r.sentiment_score for r in results) / len(results) if results else 0
 
         lines = [
             f"## 📅 {report_date} {labels['report_title']}",
             "",
             f"> {labels['analyzed_prefix']} **{len(results)}** {labels['stock_unit_compact']} | "
-            f"🟢{labels['buy_label']}:{buy_count} 🟡{labels['watch_label']}:{hold_count} 🔴{labels['sell_label']}:{sell_count} | "
+            f"{decision_summary} | "
             f"{labels['avg_score_label']}:{avg_score:.0f}",
         ]
         self._append_market_status_line(lines, results, report_language)
@@ -1926,11 +2002,11 @@ class NotificationService(
         if not results:
             return f"# {report_date} {labels['brief_title']}\n\n{labels['no_results']}"
         sorted_results = sorted(results, key=lambda x: x.sentiment_score, reverse=True)
-        buy_count, sell_count, hold_count = self._count_display_decisions(results, report_language)
+        decision_summary = self._format_display_decision_summary(results, report_language)
         lines = [
             f"# {report_date} {labels['brief_title']}",
             "",
-            f"> {len(results)} {labels['stock_unit_compact']} | 🟢{buy_count} 🟡{hold_count} 🔴{sell_count}",
+            f"> {len(results)} {labels['stock_unit_compact']} | {decision_summary}",
         ]
         self._append_market_status_line(lines, results, report_language)
         for r in sorted_results:
