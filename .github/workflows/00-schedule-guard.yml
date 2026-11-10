@@ -4,11 +4,17 @@ name: 定时兜底触发
 # 2026-11-10 实测：主流程 00:00 UTC 的定时未触发，超过 75 分钟仍无运行记录。
 # 本工作流在 UTC 00:07（北京时间 08:07）做一次检查：若过去 24 小时没有成功或进行中的主流程运行，
 # 就主动 dispatch 主流程，保证当天报告仍能产出。
+# push 触发只用于人工补跑当天报告（改 .github/guard-run.txt 即可）。
 
 on:
   schedule:
     - cron: '7 0 * * 2-6'
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/guard-run.txt'
 
 permissions:
   actions: write
